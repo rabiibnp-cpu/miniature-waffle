@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# ingestion_stats_clush.sh - tous les serveurs (clush) + tous les fichiers ingestion.log*
+# (fichiers courants, tournants .1 .2 ... et compresses .gz grace a zgrep)
+#
+# Usage : ./ingestion_stats_clush.sh [YYYY-MM-DD] > ingestion_stats.csv
+# Variables optionnelles :
+#   CLUSH_OPTS="-a"                    (defaut) ou ex. CLUSH_OPTS="-w ls9500ppc[03283,03284]" / "-g groupe"
+#   LOGGLOB="/logs/ingestion/ingestion.log*"   (defaut)
+# Prerequis : clush, gawk (local), zgrep (sur les serveurs)
+
+DAY="${1:-}"
+CLUSH_OPTS="${CLUSH_OPTS:--a}"
+LOGGLOB="${LOGGLOB:-/logs/ingestion/ingestion.log*}"
+PATTERN="${DAY:+^$DAY.*}DriverTaskQueueService"
+
+AWKFILE="$(mktemp)"
+trap 'rm -f "$AWKFILE"' EXIT
+
+cat > "$AWKFILE" <<'AWK_EOF'
+function secs(s,   t, n, u) {
+  t = 0;
+  while (match(s, /^[0-9]+[DHMS]/)) {
+    n = substr(s, 1, RLENGTH-1) + 0;
+    u = substr(s, RLENGTH, 1);
+    t += n * (u=="D" ? 86400 : (u=="H" ? 3600 : (u=="M" ? 60 : 1)));
+    s = substr(s, RLENGTH+1);
+  }
+  return t;
+}
+BEGIN {
+  print "date,job,pid,workers_running,workers_failed,items_submitted,items_inflight,results_received,sub_results_received,errors,time_since_submitted,time_since_first_worker,time_since_last_result,throughput";
+}
+{
+  gsub(/\r/, "");
+  gsub(/\([+-][0-9]+\)/, "");
+  if (!match($0, /([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}),[0-9]+ .*DriverTaskQueueService - \[([^#]+)#([^]]+)\] w:([0-9]+)\/([0-9]+) - i:([0-9]+)\/([0-9]+) - r:([0-9]+)\/([0-9]+)\/([0-9]+) - t:([^\/]+)\/([^\/]+)\/([^ ]+)/, m)) next;
+  d = m[1]; pid = m[3];
+  x = d; gsub(/[-:]/, " ", x);
+  ts = mktime(x);
+  thr = 0;
+  if ((pid in pfl) && ts > pts[pid]) thr = (pfl[pid] - m[7]) / (ts - pts[pid]);
+  pfl[pid] = m[7];
+  pts[pid] = ts;
+  printf "%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f\n", d, m[2], pid, m[4], m[5], m[6], m[7], m[8], m[9], m[10], secs(m[11]), secs(m[12]), secs(m[13]), thr;
+}
+AWK_EOF
+
+# 1) clush : zgrep sur tous les fichiers ingestion.log* de chaque serveur
+#    (le glob est developpe cote serveur, pas en local)
+# 2) tri chronologique global (les fichiers tournants arrivent dans le desordre)
+# 3) parsing + calcul du debit par pid
+clush $CLUSH_OPTS -N "zgrep -h -E '$PATTERN' $LOGGLOB 2>/dev/null" \
+  | LC_ALL=C sort -s -k1,2 \
+  | gawk -f "$AWKFILE"

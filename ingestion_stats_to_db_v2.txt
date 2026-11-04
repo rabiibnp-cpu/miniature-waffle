@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# ingestion_stats_to_db.sh  (version jdbc-cli, avec log quotidien + creation de table)
+# clush (tous les serveurs) -> parsing des logs ingestion -> insertion PostgreSQL via jdbc-cli
+# Connexion : fichier newh_aps.conf (lu par jdbc-cli).
+# Une ligne deja presente (meme ts + job_name + pid) n'est JAMAIS reinseree
+# (INSERT ... ON CONFLICT DO NOTHING sur la cle primaire).
+#
+# Log quotidien : /apps/exploit/Pushgateway_reporter_script/logs/ingestion_stats_to_db_AAAAMMJJ.log
+#
+# Cron (toutes les 5 min) :
+#   */5 * * * * /apps/exploit/Pushgateway_reporter_script/ingestion_stats_to_db.sh >/dev/null 2>&1
+#   (tout est deja ecrit dans le log quotidien)
+#
+# Prerequis : clush, gawk, jdbc-cli. newh_aps.conf a cote du script (ou CONF=/chemin/complet).
+# Historique : LOOKBACK_DAYS=60 ./ingestion_stats_to_db.sh
+
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+cd "$(dirname "$0")" || exit 1
+
+# ---------- Configuration ----------
+CONF="${CONF:-newh_aps.conf}"
+JDBC_CMD="${JDBC_CMD:-jdbc-cli -c $CONF -ttd -q}"
+TABLE="${TABLE:-aps.ingestion_metrics}"
+DB_TZ="${DB_TZ:-Europe/Paris}"          # fuseau des dates ecrites dans les logs
+LOGDIR="${LOGDIR:-/logs/ingestion}"     # logs a analyser (sur les serveurs)
+CLUSH_OPTS="${CLUSH_OPTS:--a}"
+LOOKBACK_DAYS="${LOOKBACK_DAYS:-1}"     # aujourd'hui + N jours precedents (gere le passage de minuit)
+BATCH="${BATCH:-400}"                   # lignes par INSERT (limite d'un argument shell ~128 Ko)
+
+# ---------- Log quotidien du script ----------
+OUT_LOG_DIR="${OUT_LOG_DIR:-/apps/exploit/Pushgateway_reporter_script/logs}"
+mkdir -p "$OUT_LOG_DIR" 2>/dev/null
+LOGFILE="$OUT_LOG_DIR/ingestion_stats_to_db_$(date +%Y%m%d).log"
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOGFILE"; }
+
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+CSV="$TMPD/stats.csv"
+VALS="$TMPD/values.sql"
+ERR="$TMPD/jdbc.err"
+
+# Execute une requete via jdbc-cli. Positionne OUTPUT, RC, N (dernier nombre de la sortie).
+run_query() {
+  OUTPUT=$($JDBC_CMD "$1" 2>"$ERR")
+  RC=$?
+  N=$(printf '%s\n' "$OUTPUT" | grep -Eo '[0-9]+' | tail -n 1)
+}
+
+fail() {   # fail "message"
+  log "ERREUR $1 (code $RC) sortie='$OUTPUT'"
+  [ -s "$ERR" ] && sed 's/^/    stderr: /' "$ERR" | tee -a "$LOGFILE"
+  log "===== FIN en erreur (duree ${SECONDS}s) ====="
+  exit 1
+}
+
+# ---------- Anti-chevauchement (si un run dure plus de 5 min) ----------
+exec 9>/tmp/ingestion_to_db.lock
+flock -n 9 || { log "deja en cours, on saute"; exit 0; }
+
+log "===== DEBUT ($0) ====="
+
+# ---------- 0) La table existe-t-elle ? Sinon on la cree ----------
+SCHEMA="${TABLE%%.*}"
+TNAME="${TABLE#*.}"
+CHECK_Q="SELECT count(*) FROM information_schema.tables WHERE table_schema='$SCHEMA' AND table_name='$TNAME'"
+
+run_query "$CHECK_Q"
+[ "$RC" -ne 0 ] || [ -z "$N" ] && fail "verification de la table $TABLE"
+
+if [ "$N" -eq 0 ]; then
+  log "table $TABLE absente -> creation"
+  run_query "CREATE SCHEMA IF NOT EXISTS $SCHEMA"
+  [ "$RC" -ne 0 ] && fail "creation du schema $SCHEMA"
+
+  DDL="CREATE TABLE IF NOT EXISTS $TABLE (
+    ts                TIMESTAMPTZ NOT NULL,
+    job_name          TEXT        NOT NULL,
+    pid               TEXT        NOT NULL,
+    workers_running   INTEGER,
+    workers_failed    INTEGER,
+    items_submitted   INTEGER,
+    items_inflight    INTEGER,
+    results_received  INTEGER,
+    results_errors    INTEGER,
+    time_since_sub    INTEGER,
+    time_since_first  INTEGER,
+    time_since_last   INTEGER,
+    throughput        NUMERIC,
+    PRIMARY KEY (ts, job_name, pid)
+  )"
+  run_query "$DDL"
+  [ "$RC" -ne 0 ] && fail "creation de la table $TABLE"
+
+  run_query "$CHECK_Q"
+  if [ "$RC" -ne 0 ] || [ "$N" != "1" ]; then fail "table $TABLE toujours absente apres creation"; fi
+  log "table $TABLE creee"
+else
+  log "table $TABLE presente"
+fi
+
+# ---------- Fenetre de dates ----------
+DAYS="$(date +%F)"
+for i in $(seq 1 "$LOOKBACK_DAYS"); do DAYS="$DAYS|$(date -d "-$i day" +%F)"; done
+PATTERN="^($DAYS).*DriverTaskQueueService"
+MTIME=$((LOOKBACK_DAYS + 1))            # ne lire que les fichiers modifies recemment
+log "fenetre analysee : $DAYS (fichiers $LOGDIR/ingestion.log*, serveurs: clush $CLUSH_OPTS)"
+
+# ---------- awk 1 : logs -> CSV ----------
+cat > "$TMPD/parse.awk" <<'AWK_EOF'
+function secs(s,   t, n, u) {
+  t = 0;
+  while (match(s, /^[0-9]+[DHMS]/)) {
+    n = substr(s, 1, RLENGTH-1) + 0;
+    u = substr(s, RLENGTH, 1);
+    t += n * (u=="D" ? 86400 : (u=="H" ? 3600 : (u=="M" ? 60 : 1)));
+    s = substr(s, RLENGTH+1);
+  }
+  return t;
+}
+BEGIN {
+  print "date,job,pid,workers_running,workers_failed,items_submitted,items_inflight,results_received,sub_results_received,errors,time_since_submitted,time_since_first_worker,time_since_last_result,throughput";
+}
+{
+  gsub(/\r/, "");
+  gsub(/\([+-][0-9]+\)/, "");
+  if (!match($0, /([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}),[0-9]+ .*DriverTaskQueueService - \[([^#]+)#([^]]+)\] w:([0-9]+)\/([0-9]+) - i:([0-9]+)\/([0-9]+) - r:([0-9]+)\/([0-9]+)\/([0-9]+) - t:([^\/]+)\/([^\/]+)\/([^ ]+)/, m)) next;
+  d = m[1]; pid = m[3];
+  x = d; gsub(/[-:]/, " ", x);
+  ts = mktime(x);
+  thr = 0;
+  if ((pid in pfl) && ts > pts[pid]) thr = (pfl[pid] - m[7]) / (ts - pts[pid]);
+  pfl[pid] = m[7];
+  pts[pid] = ts;
+  printf "%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f\n", d, m[2], pid, m[4], m[5], m[6], m[7], m[8], m[9], m[10], secs(m[11]), secs(m[12]), secs(m[13]), thr;
+}
+AWK_EOF
+
+# ---------- awk 2 : CSV -> tuples SQL (un par ligne) ----------
+# La colonne sub_results_received (CSV col. 9) n'existe pas dans la table : ignoree.
+cat > "$TMPD/tosql.awk" <<'AWK_EOF'
+BEGIN { FS = ","; q = "\047" }
+NR == 1 { next }
+{
+  job = $2; gsub(q, q q, job);
+  pid = $3; gsub(q, q q, pid);
+  ts = "(TIMESTAMP " q $1 q " AT TIME ZONE " q tz q ")";
+  print "(" ts "," q job q "," q pid q "," $4 "," $5 "," $6 "," $7 "," $8 "," $10 "," $11 "," $12 "," $13 "," $14 ")";
+}
+AWK_EOF
+
+# ---------- 1) Collecte + parsing -> CSV temporaire ----------
+REMOTE="find $LOGDIR -name 'ingestion.log*' -mtime -$MTIME -print0 | xargs -0 -r zgrep -h -E '$PATTERN' 2>/dev/null"
+
+clush $CLUSH_OPTS -N "$REMOTE" \
+  | LC_ALL=C sort -s -k1,2 \
+  | gawk -f "$TMPD/parse.awk" > "$CSV"
+
+NBCSV=$(( $(wc -l < "$CSV") - 1 ))
+if [ "$NBCSV" -le 0 ]; then
+  log "aucune ligne trouvee dans les logs"
+  log "===== FIN OK (duree ${SECONDS}s) ====="
+  exit 0
+fi
+FIRST_TS=$(sed -n '2p' "$CSV" | cut -d, -f1)
+LAST_TS=$(tail -n 1 "$CSV" | cut -d, -f1)
+log "lignes parsees : $NBCSV (de $FIRST_TS a $LAST_TS)"
+
+gawk -v tz="$DB_TZ" -f "$TMPD/tosql.awk" "$CSV" > "$VALS"
+split -l "$BATCH" "$VALS" "$TMPD/chunk."
+NBLOTS=$(ls "$TMPD"/chunk.* | wc -l)
+
+# ---------- 2) Insertion via jdbc-cli, par lots ----------
+TOTAL=0
+I=0
+for f in "$TMPD"/chunk.*; do
+  I=$((I + 1))
+  ROWS_IN_BATCH=$(wc -l < "$f")
+  ROWS="$(paste -sd, "$f")"
+  QUERY="WITH ins AS (INSERT INTO $TABLE (ts, job_name, pid, workers_running, workers_failed, items_submitted, items_inflight, results_received, results_errors, time_since_sub, time_since_first, time_since_last, throughput) VALUES $ROWS ON CONFLICT (ts, job_name, pid) DO NOTHING RETURNING 1) SELECT count(*) FROM ins"
+
+  run_query "$QUERY"
+  if [ "$RC" -ne 0 ] || [ -z "$N" ]; then fail "insertion du lot $I/$NBLOTS"; fi
+
+  TOTAL=$((TOTAL + N))
+  log "lot $I/$NBLOTS : lignes=$ROWS_IN_BATCH inserees=$N deja_en_base=$((ROWS_IN_BATCH - N))"
+done
+
+SKIPPED=$((NBCSV - TOTAL))
+if [ "$TOTAL" -eq 0 ]; then
+  log "RESULTAT : 0 nouvelle ligne, les $NBCSV lignes etaient deja en base (pas de doublon insere)"
+else
+  log "RESULTAT : $TOTAL nouvelles lignes inserees, $SKIPPED deja en base"
+fi
+log "===== FIN OK (duree ${SECONDS}s) ====="
